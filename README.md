@@ -50,4 +50,5 @@ ollama serve
 2. [текст промпта]
 3. [текст промпта]
 
-<img width="1934" height="1186" alt="2026-07-01_17-16-18" src="https://github.com/user-attachments/assets/d1e56d35-2f78-416e-a247-4d3109df9093" />
+<img width="1934" height="1186" alt="2026-07-01_17-16-18" src="https://github.com/user-attachments/assets/ad2e662e-0572-481d-9558-a0b832cbd8a5" />
+
