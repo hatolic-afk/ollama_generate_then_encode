@@ -1,277 +1,287 @@
-"""
-ComfyUI Custom Node: Ollama Random Prompt + Conditioning for Flux 2 Klein
-СПЕЦИАЛЬНАЯ ВЕРСИЯ ДЛЯ QWEN 3.5
-Категория: Hatolic
-Легендарный fallback: уточки в ванной
-"""
-
 import torch
-import requests
-import json
-import time
 import folder_paths
+from comfy.utils import ProgressBar
+import numpy as np
 import os
+import tempfile
+import time
+import subprocess
+import math
+import cv2
 import re
-from datetime import datetime
+
+# Импорты из основного файла
+import sys
+sys.path.append(os.path.dirname(__file__))
+from video_segmentation_node import (
+    VIDEO_EXTENSIONS, 
+    _get_video_info, 
+    _extract_segment_frames, 
+    _extract_audio_segment,
+    FFMPEG_BIN
+)
+
+# Импорты для генерации
+from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
+from comfy import samplers
+from comfy_extras.nodes_advanced_sampler import SamplerCustomAdvanced
+from comfy_extras.nodes_vae import VAEDecodeTiled
+from comfy_extras.nodes_sampling import KSamplerSelect, BasicScheduler
+from comfy_extras.nodes_random_noise import RandomNoise
+from comfy.sd import VAE
+from comfy.ldm.modules.diffusionmodules import model
 
 
-class Ollama_RandomPrompt_Conditioning:
-    
+class VideoSegmentationGenerateAndConcat:
     @classmethod
     def INPUT_TYPES(cls):
-        models_list = cls.get_ollama_models()
+        input_dir = folder_paths.get_input_directory()
+        files = []
+        if os.path.isdir(input_dir):
+            for f in os.listdir(input_dir):
+                full = os.path.join(input_dir, f)
+                if not os.path.isfile(full):
+                    continue
+                ext = os.path.splitext(f)[1].lower().lstrip(".")
+                if ext in VIDEO_EXTENSIONS:
+                    files.append(f)
+
         return {
             "required": {
-                "ollama_host": ("STRING", {"default": "http://127.0.0.1:11434"}),
-                "ollama_model": (models_list, {"default": models_list[0] if models_list else "qwen35-uncensored-fixed"}),
-                "system_prompt": ("STRING", {"multiline": True, "default": "Generate a detailed image prompt, 200-500 words, as a single vivid scene. Natural language, no lists, no tags. Describe anything: a person, a place, an object, an interior, an exterior — completely random each time. Output only the prompt."}),
-                "temperature": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.05}),
-                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffff}),
-                "max_retries": ("INT", {"default": 3, "min": 1, "max": 5}),
-                "save_prompts": ("BOOLEAN", {"default": True, "label": "💾 Save prompts to file"}),
+                "video": (sorted(files), {"video_upload": True}),
+                "duration_seconds": ("FLOAT", {"default": 5.0, "min": 0.5, "max": 60.0, "step": 0.1}),
+                "overlap_frames": ("INT", {"default": 2, "min": 0, "max": 30, "step": 1}),
+                "align_to_frames": ("BOOLEAN", {"default": True}),
+                "target_fps": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 60.0, "step": 0.1}),
+                "width": ("INT", {"default": 1344, "min": 64, "max": 4096, "step": 32}),
+                "height": ("INT", {"default": 768, "min": 64, "max": 4096, "step": 32}),
+                "length": ("INT", {"default": 124, "min": 8, "max": 1024, "step": 8}),
+                "prompt": ("STRING", {"multiline": True, "default": ""}),
+                "steps": ("INT", {"default": 6, "min": 1, "max": 100}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 20.0, "step": 0.1}),
+                "sampler_name": (["res_multistep", "euler", "dpmpp_2m"], {"default": "res_multistep"}),
+                "scheduler": (["simple", "normal", "karras"], {"default": "simple"}),
+                "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "tile_size": ("INT", {"default": 768, "min": 256, "max": 2048, "step": 64}),
+                "tile_overlap": ("INT", {"default": 128, "min": 0, "max": 512, "step": 16}),
+                "temporal_size": ("INT", {"default": 128, "min": 32, "max": 512, "step": 16}),
+                "temporal_overlap": ("INT", {"default": 16, "min": 0, "max": 256, "step": 8}),
+                "join_mode": (["cut", "dissolve"], {"default": "cut"}),
+                "transition_duration": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 5.0, "step": 0.05}),
+                "filename_prefix": ("STRING", {"default": "generated"}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFFFFFFFFFF}),
             },
             "optional": {
                 "clip": ("CLIP",),
+                "vae": ("VAE",),
+                "audio_vae": ("VAE",),
+                "ref_image": ("IMAGE",),
+                "model": ("MODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
             }
         }
-    
-    RETURN_TYPES = ("CONDITIONING", "STRING")
-    RETURN_NAMES = ("conditioning", "generated_prompt")
-    FUNCTION = "go"
-    CATEGORY = "Hatolic"
-    
-    @classmethod
-    def get_ollama_models(cls):
-        try:
-            response = requests.get("http://127.0.0.1:11434/api/tags", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                models = [model["name"] for model in data.get("models", [])]
-                if models:
-                    return models
-        except:
-            pass
-        return ["qwen35-uncensored-fixed", "gemma:latest", "llama3.2:latest"]
 
-    def get_prompt_counter(self, filename):
-        """Получает последний номер промпта из файла"""
-        try:
-            if os.path.exists(filename):
-                with open(filename, "r", encoding="utf-8") as f:
-                    lines = f.readlines()
-                    # Ищем последнюю строку с номером
-                    for line in reversed(lines):
-                        match = re.match(r'^(\d+)\.', line.strip())
-                        if match:
-                            return int(match.group(1))
-            return 0
-        except:
-            return 0
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "generate_and_concat"
+    CATEGORY = "Hatolic/video"
 
-    def save_prompt_to_file(self, prompt, model, temperature, seed):
-        """Сохраняет сгенерированный промпт в файл с нумерацией"""
-        try:
-            # Папка для сохранения
-            output_dir = os.path.join(folder_paths.get_output_directory(), "prompts")
-            
-            # Создаем папку если её нет
-            if not os.path.exists(output_dir):
-                os.makedirs(output_dir, exist_ok=True)
-                print(f"[Ollama] 📁 Created directory: {output_dir}")
-            
-            # Имя файла: prompts_2026-07-01.txt
-            today = datetime.now().strftime("%Y-%m-%d")
-            filename = os.path.join(output_dir, f"prompts_{today}.txt")
-            
-            # Получаем следующий номер
-            counter = self.get_prompt_counter(filename)
-            next_number = counter + 1
-            
-            # Записываем промпт с номером
-            with open(filename, "a", encoding="utf-8") as f:
-                f.write(f"{next_number}. {prompt}\n\n")
-            
-            print(f"[Ollama] 💾 Saved #{next_number} to: {filename}")
-            print(f"[Ollama] 📝 Prompt #{next_number} length: {len(prompt)} chars")
-            return True
-            
-        except Exception as e:
-            print(f"[Ollama] ❌ FAILED to save: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+    def _concat_with_ffmpeg(self, video_paths, output_path, join_mode="cut", transition_duration=0.5):
+        if len(video_paths) == 0:
+            raise ValueError("No videos to concatenate")
+        if len(video_paths) == 1:
+            cmd = [FFMPEG_BIN, "-i", video_paths[0], "-c", "copy", "-y", output_path]
+            subprocess.run(cmd, check=True, capture_output=True)
+            return
 
-    def generate_prompt(self, host, model, system_prompt, temperature, seed, max_retries):
-        url = f"{host}/api/chat"
-        
-        # ============================================================
-        # СПЕЦИАЛЬНО ДЛЯ QWEN 3.5
-        # ============================================================
-        is_qwen35 = 'qwen35' in model.lower() or 'qwen3.5' in model.lower()
-        
-        if is_qwen35:
-            print(f"[Ollama] 🐉 Qwen 3.5 mode (ChatML + thinking OFF)")
-            
-            # Формируем сообщения в правильном формате для Qwen 3.5
-            combined_prompt = f"""<|im_start|>system
-{system_prompt}
-<|im_end|>
-<|im_start|>user
-Generate a random image prompt now. Follow the instructions exactly. Output only the prompt. Nothing else. No greetings, no explanations.
-<|im_end|>
-<|im_start|>assistant
-"""
-            
-            messages = [
-                {"role": "user", "content": combined_prompt}
-            ]
-            
-            options = {
-                "temperature": temperature,
-                "num_predict": 800,
-                "min_p": 0.1,
-                "repeat_penalty": 1.1,
-                "top_k": 20,
-                "top_p": 0.9,
-                "chat_template_kwargs": {"enable_thinking": False}
-            }
-            
-            timeout = 180
-            
-        # ============================================================
-        # ОБЫЧНЫЙ QWEN (2.5, 3)
-        # ============================================================
-        elif 'qwen' in model.lower():
-            print(f"[Ollama] 🐉 Qwen mode")
-            messages = [
-                {"role": "user", "content": f"{system_prompt}\n\nGenerate a random image prompt now. Output only the prompt."}
-            ]
-            options = {
-                "temperature": temperature,
-                "num_predict": 700,
-                "min_p": 0.1,
-                "repeat_penalty": 1.1,
-            }
-            timeout = 150
-            
-        # ============================================================
-        # GEMMA
-        # ============================================================
-        elif 'gemma' in model.lower():
-            print(f"[Ollama] 🔱 Gemma mode")
-            messages = [
-                {"role": "user", "content": f"{system_prompt}\n\nGenerate a random image prompt now. Follow the instructions exactly. Output only the prompt. Nothing else."}
-            ]
-            options = {
-                "temperature": temperature,
-                "num_predict": 800,
-                "min_p": 0.1,
-                "repeat_penalty": 1.1,
-            }
-            timeout = 180
-            
-        # ============================================================
-        # LLAMA / MISTRAL
-        # ============================================================
-        else:
-            print(f"[Ollama] 🦙 Standard mode")
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": "Generate a random image prompt now. Follow the instructions exactly. Output only the prompt. Nothing else."}
-            ]
-            options = {
-                "temperature": temperature,
-                "num_predict": 900,
-                "min_p": 0.1,
-                "repeat_penalty": 1.1,
-            }
-            timeout = 180
-
-        payload = {
-            "model": model,
-            "messages": messages,
-            "stream": False,
-            "options": options
-        }
-
-        if seed > 0:
-            payload["options"]["seed"] = seed
-
-        # ============================================================
-        # ОТПРАВЛЯЕМ
-        # ============================================================
-        for attempt in range(max_retries):
+        if join_mode == "cut":
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                for path in video_paths:
+                    f.write(f"file '{os.path.abspath(path)}'\n")
+                list_file = f.name
             try:
-                print(f"[Ollama] 🔄 Attempt {attempt + 1}/{max_retries}")
-                print(f"[Ollama] 📊 num_predict: {options.get('num_predict', 'N/A')}")
-                if is_qwen35:
-                    print(f"[Ollama] 🧠 thinking: OFF")
-                
-                response = requests.post(url, json=payload, timeout=timeout)
-                response.raise_for_status()
-                result = response.json()
-                
-                generated = result.get("message", {}).get("content", "").strip()
-                
-                if is_qwen35 and generated:
-                    generated = re.sub(r'<think>.*?</think>', '', generated, flags=re.DOTALL)
-                    generated = generated.strip()
-                
-                print(f"[Ollama] 📥 Got {len(generated)} chars")
-                if generated:
-                    print(f"[Ollama] 📄 Preview: {generated[:100]}...")
-                
-                if generated and len(generated) > 50:
-                    print(f"[Ollama] ✅ SUCCESS: {len(generated)} chars")
-                    return generated
+                cmd = [
+                    FFMPEG_BIN,
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", list_file,
+                    "-c", "copy",
+                    "-y",
+                    output_path
+                ]
+                subprocess.run(cmd, check=True, capture_output=True)
+            finally:
+                if os.path.exists(list_file):
+                    os.unlink(list_file)
+        elif join_mode == "dissolve":
+            durations = []
+            for path in video_paths:
+                cmd = [FFMPEG_BIN, "-i", path, "-f", "null", "-"]
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                match = re.search(r"Duration: (\d{2}):(\d{2}):(\d{2}\.\d+)", proc.stderr)
+                if match:
+                    h, m, s = match.groups()
+                    duration = int(h) * 3600 + int(m) * 60 + float(s)
+                    durations.append(duration)
                 else:
-                    print(f"[Ollama] ⚠️ Too short ({len(generated)} chars), retry")
-                    time.sleep(1)
-                    
-            except requests.exceptions.Timeout:
-                print(f"[Ollama] ⏰ TIMEOUT after {timeout}s")
-                time.sleep(2)
-            except Exception as e:
-                print(f"[Ollama] ❌ Error: {e}")
-                time.sleep(2)
+                    durations.append(5.0)
 
-        # ============================================================
-        # ЛЕГЕНДАРНЫЙ FALLBACK
-        # ============================================================
-        print("[Ollama] 🦆 FALLBACK: Rubber ducks in the bathroom!")
-        return """A bathroom turned upside down. The bathtub is filled with rubber ducks wearing tiny sunglasses, all floating in bright pink bubblegum-scented foam. On the mirror, someone wrote 'You are awesome' in lipstick backwards. A potted cactus on the toilet tank wears a party hat. A single disco ball spins slowly above the sink, throwing sparkles across the ceiling tiles. Wide angle, vibrant neon pink and turquoise lighting, fun and chaotic, late night party aftermath style."""
+            inputs = []
+            for path in video_paths:
+                inputs.extend(["-i", path])
 
-    def go(self, ollama_host, ollama_model, system_prompt, temperature, seed, max_retries, save_prompts=True, clip=None):
-        generated_prompt = self.generate_prompt(ollama_host, ollama_model, system_prompt, temperature, seed, max_retries)
+            filter_parts = []
+            filter_names = []
+            current_offset = 0
+
+            for i in range(1, len(video_paths)):
+                offset = current_offset + durations[i-1] - transition_duration
+                filter_name = f"f{i-1}"
+                if i == 1:
+                    filter_parts.append(
+                        f"[0:v][1:v]xfade=transition=fade:duration={transition_duration}:offset={offset}[{filter_name}]"
+                    )
+                else:
+                    filter_parts.append(
+                        f"[{filter_names[-1]}][{i}:v]xfade=transition=fade:duration={transition_duration}:offset={offset}[{filter_name}]"
+                    )
+                current_offset = offset
+                filter_names.append(filter_name)
+
+            if filter_parts:
+                filter_complex = ";".join(filter_parts)
+                last_filter = filter_names[-1] if filter_names else "[0:v]"
+                cmd = [
+                    FFMPEG_BIN,
+                    *inputs,
+                    "-filter_complex", filter_complex,
+                    "-map", f"[{last_filter}]",
+                    "-c:v", "libx264",
+                    "-preset", "medium",
+                    "-crf", "18",
+                    "-pix_fmt", "yuv420p",
+                    "-y",
+                    output_path
+                ]
+                subprocess.run(cmd, check=True, capture_output=True)
+            else:
+                cmd = [FFMPEG_BIN, "-i", video_paths[0], "-c", "copy", "-y", output_path]
+                subprocess.run(cmd, check=True, capture_output=True)
+
+    def generate_and_concat(self, **kwargs):
+        """Генерирует сегменты и объединяет их в одно видео."""
         
-        print(f"[Ollama] 📏 Final length: {len(generated_prompt)} chars")
-        
-        # ============================================================
-        # СОХРАНЯЕМ ПРОМПТ В ФАЙЛ
-        # ============================================================
-        if save_prompts:
-            saved = self.save_prompt_to_file(generated_prompt, ollama_model, temperature, seed)
-            if not saved:
-                print("[Ollama] ⚠️ WARNING: Could not save prompt to file!")
-                print(f"[Ollama] 💡 Try checking permissions for: {folder_paths.get_output_directory()}")
-        else:
-            print("[Ollama] ⏭️ Saving disabled")
+        # Извлекаем параметры
+        video = kwargs.get("video")
+        duration_seconds = kwargs.get("duration_seconds", 5.0)
+        overlap_frames = kwargs.get("overlap_frames", 2)
+        align_to_frames = kwargs.get("align_to_frames", True)
+        target_fps = kwargs.get("target_fps", 0.0)
 
+        width = kwargs.get("width", 1344)
+        height = kwargs.get("height", 768)
+        length = kwargs.get("length", 124)
+        prompt = kwargs.get("prompt", "")
+        steps = kwargs.get("steps", 6)
+        cfg = kwargs.get("cfg", 1.0)
+        sampler_name = kwargs.get("sampler_name", "res_multistep")
+        scheduler = kwargs.get("scheduler", "simple")
+        denoise = kwargs.get("denoise", 1.0)
+        tile_size = kwargs.get("tile_size", 768)
+        tile_overlap = kwargs.get("tile_overlap", 128)
+        temporal_size = kwargs.get("temporal_size", 128)
+        temporal_overlap = kwargs.get("temporal_overlap", 16)
+        join_mode = kwargs.get("join_mode", "cut")
+        transition_duration = kwargs.get("transition_duration", 0.5)
+        filename_prefix = kwargs.get("filename_prefix", "generated")
+        seed = kwargs.get("seed", 0)
+
+        clip = kwargs.get("clip")
+        vae = kwargs.get("vae")
+        audio_vae = kwargs.get("audio_vae")
+        ref_image = kwargs.get("ref_image")
+        model = kwargs.get("model")
+        positive = kwargs.get("positive")
+        negative = kwargs.get("negative")
+
+        # Проверка обязательных входов
         if clip is None:
-            print("[Ollama] ⚠️ No CLIP input - returning prompt only")
-            return (None, generated_prompt)
+            raise ValueError("Missing required input: clip")
+        if vae is None:
+            raise ValueError("Missing required input: vae")
+        if audio_vae is None:
+            raise ValueError("Missing required input: audio_vae")
+        if ref_image is None:
+            raise ValueError("Missing required input: ref_image")
+        if model is None:
+            raise ValueError("Missing required input: model")
+        if positive is None:
+            raise ValueError("Missing required input: positive")
+        if negative is None:
+            raise ValueError("Missing required input: negative")
 
-        tokens = clip.tokenize(generated_prompt)
-        cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
-        conditioning = [[cond, {"pooled_output": pooled}]]
+        # 1. Сегментируем видео
+        video_path = folder_paths.get_annotated_filepath(video)
+        original_fps, total_frames, video_duration = _get_video_info(video_path)
+        used_fps = target_fps if target_fps > 0 else original_fps
+        total_segments = max(1, int(math.ceil(video_duration / duration_seconds)))
 
-        return (conditioning, generated_prompt)
+        # Временные файлы для сегментов
+        temp_dir = tempfile.mkdtemp(prefix="segments_")
+        segment_paths = []
 
+        pbar = ProgressBar(total_segments)
 
-NODE_CLASS_MAPPINGS = {
-    "Ollama Random Prompt Conditioning": Ollama_RandomPrompt_Conditioning,
-}
+        for seg_idx in range(total_segments):
+            start_sec = seg_idx * duration_seconds
+            end_sec = min(start_sec + duration_seconds, video_duration)
+            is_last = (seg_idx == total_segments - 1)
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "Ollama Random Prompt Conditioning": "🎲 Ollama → Random Prompt → Flux",
-}
+            # Извлекаем кадры и аудио
+            images, actual_start, actual_end = _extract_segment_frames(
+                video_path, start_sec, end_sec,
+                fps=used_fps,
+                original_fps=original_fps,
+                overlap_frames=overlap_frames,
+                align_to_frames=align_to_frames,
+                is_last=is_last
+            )
+            if images.shape[0] == 0:
+                continue
+            audio = _extract_audio_segment(video_path, actual_start, actual_end - actual_start)
+
+            # Здесь должна быть логика генерации с использованием minimax
+            # ВНИМАНИЕ: Этот код требует доработки - вызов MiniMaxH3ReferenceToVideo
+            # из кода сложен, так как нода ожидает входы из графа.
+            # Рекомендую использовать граф с циклом, как в вашем workflow.
+            
+            print(f"[VideoSegmentationGenerateAndConcat] Segment {seg_idx+1}/{total_segments}")
+            print(f"  - frames: {images.shape[0]}, audio: {audio['waveform'].shape}")
+            
+            # Сохраняем сегмент во временный файл
+            # Здесь нужно сохранить сгенерированное видео, а не оригинальные кадры
+            # Пока сохраняем заглушку
+            temp_path = os.path.join(temp_dir, f"segment_{seg_idx:04d}.mp4")
+            segment_paths.append(temp_path)
+            
+            pbar.update(1)
+
+        # Если нет сегментов - возвращаем None
+        if len(segment_paths) == 0:
+            print("[VideoSegmentationGenerateAndConcat] No segments generated")
+            return (None,)
+
+        # 2. Конкатенируем сегменты
+        output_dir = folder_paths.get_output_directory()
+        full_output_folder = os.path.join(output_dir, "video")
+        os.makedirs(full_output_folder, exist_ok=True)
+
+        counter = int(time.time() * 1000)
+        output_file = f"{filename_prefix}_{counter}.mp4"
+        output_path = os.path.join(full_output_folder, output_file)
+
+        self._concat_with_ffmpeg(segment_paths, output_path, join_mode, transition_duration)
+
+        print(f"[VideoSegmentationGenerateAndConcat] ✅ Saved to: {output_path}")
+        return ({"video": output_path},)
